@@ -56,12 +56,15 @@ def add_argument():
                         help='model architecture: ' +
                             ' | '.join(model_names+list(custom_model_names.keys())) +
                             ' (default: ViT_B)')
+    parser.add_argument('--num_classes', type=int, default=7, help="number of classes")
 
     ######### mutator
     parser.add_argument('--search', action='store_true', help="conduct search")
     parser.add_argument('--unrolled', action='store_true', help="unrolled gradients")
     parser.add_argument('--mutator', default='OnehotMutator', type=str,
                         help='mutator type')
+    parser.add_argument('--arch_path', type=str, default=None,
+                        help='the path of the searched architecture (json file)')
 
     ######### dataset 
     parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
@@ -183,7 +186,7 @@ def main_worker(gpu, ngpus_per_node, args):
             print(f"rank{args.local_rank}=> creating model '{args.arch}'")
             model = models.__dict__[args.arch]()
     elif args.arch.lower() in custom_model_names:
-        model = custom_model_names[args.arch](image_size=(448,608))
+        model = custom_model_names[args.arch](image_size=(448,608), num_classes=args.num_classes)
 
     mutator = OnehotMutator(model)
     optimizer_mutator = torch.optim.Adam(
@@ -200,9 +203,6 @@ def main_worker(gpu, ngpus_per_node, args):
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
         deepspeed.init_distributed()
-    def print_rank_0(msg):
-        if args.local_rank <=0:
-            print(f"rank{args.local_rank} {msg}")
 
     args.batch_size = int(args.batch_size / ngpus_per_node)
     if not torch.cuda.is_available():# and not torch.backends.mps.is_available():
@@ -217,10 +217,31 @@ def main_worker(gpu, ngpus_per_node, args):
                                 weight_decay=args.weight_decay)
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
     scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
+    # Initialize DeepSpeed for the model
+    model, optimizer, _, _ = deepspeed.initialize(
+        model = model, optimizer = optimizer, args = args,
+        lr_scheduler = None,#scheduler,
+        dist_init_required=True
+    )
+    if args.search:
+        mutator, optimizer_mutator, _, _ = deepspeed.initialize(
+            args=args, model=mutator, model_parameters=mutator.parameters(), optimizer=optimizer_mutator)
+
     # optionally resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
             print(f"rank{args.local_rank}=> loading checkpoint '{args.resume}'")
+            # # 使用DeepSpeedEngine读取 checkpoint
+            # tag = 'best' # or 'last
+            # load_path, checkpoint = model.load_checkpoint(args.resume, tag='best')
+            # load_path, checkpoint = mutator.load_checkpoint(args.resume, tag='best') # failed
+            # args.start_epoch = checkpoint['epoch']
+            # best_acc1 = checkpoint['best_acc1']
+            # if args.gpu is not None:
+            #     # best_acc1 may be from a checkpoint from a different GPU
+            #     best_acc1 = best_acc1.to(args.gpu)
+
+            # 使用 pytorch 读取 checkpoint
             if args.gpu is None:
                 checkpoint = torch.load(args.resume)
             elif torch.cuda.is_available():
@@ -235,19 +256,12 @@ def main_worker(gpu, ngpus_per_node, args):
             model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             scheduler.load_state_dict(checkpoint['scheduler'])
+            if args.search:
+                mutator.load_state_dict(checkpoint['mutator'])
+                optimizer_mutator.load_state_dict(checkpoint['optimizer_mutator'])
             print(f"rank{args.local_rank}=> loaded checkpoint '{args.resume}' (epoch {checkpoint['epoch']})")
         else:
             print(f"rank{args.local_rank}=> no checkpoint found at '{args.resume}'")
-
-    # Initialize DeepSpeed for the model
-    model, optimizer, _, _ = deepspeed.initialize(
-        model = model, optimizer = optimizer, args = args,
-        lr_scheduler = None,#scheduler,
-        dist_init_required=True
-    )
-    if args.search:
-        mutator, optimizer_mutator, _, _ = deepspeed.initialize(
-            args=args, model=mutator, model_parameters=mutator.parameters(), optimizer=optimizer_mutator)
 
 
     # Data loading code
@@ -262,45 +276,44 @@ def main_worker(gpu, ngpus_per_node, args):
         train_dataset = Ham10000Dataset(traindir, add_random_transforms=True)
         val_dataset = Ham10000Dataset(valdir)
         test_dataset = Ham10000Dataset(testdir)
-        # if args.concat_train_val:
-        #     train_dataset = ConcatDataset([train_dataset, val_dataset])
-        #     val_dataset = test_dataset
-        # if args.search:
-        #     # make sure train and val dataset have the same size when searching
-        #     indices = torch.randperm(len(train_dataset))
-        #     split_index = len(train_dataset) // 2
-        #     dataset1 = torch.utils.data.Subset(train_dataset, indices[:split_index])
-        #     dataset2 = torch.utils.data.Subset(train_dataset, indices[split_index:])
-        #     train_dataset, val_dataset = dataset1, dataset2
             
 
     if args.local_rank != -1:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-        val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False, drop_last=True)
+        val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False, drop_last=False)
+        test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset, shuffle=False, drop_last=False)
     else:
         train_sampler = None
         val_sampler = None
+        test_sampler = None
 
     print(f"rank{args.local_rank} Batch_size:{args.batch_size}")
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
-
     val_loader = torch.utils.data.DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True, sampler=val_sampler)
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=True, sampler=test_sampler)
 
 
     if args.evaluate:
-        metrics_dict = validate(val_loader, model, criterion, args)
-        acc1 = metrics_dict['top1'].avg
-        auc = metrics_dict['auc'].avg
-        print(f'Accuracy: {acc1:.4f} AUC:{auc:.4f}')
-        return
+        mutator.reset()
+        loss = torch.empty(1).cuda()
+        acc1 = torch.empty(1).cuda()
+        metrics_dict = validate(test_loader, model, criterion, args)
+        loss[0] = metrics_dict['loss'].avg
+        acc1[0] = metrics_dict['top1'].avg
+        # auc = metrics_dict['auc'].avg
+        # print(f'Accuracy: {acc1:.4f} AUC:{auc:.4f}')
+        print(f'Accuracy: {acc1:.4f} ')
+        return (loss, acc1)
 
     losses = torch.empty(args.epochs).cuda()
     acc1s = torch.empty(args.epochs).cuda()
-    aucs = torch.empty(args.epochs).cuda()
+    # aucs = torch.empty(args.epochs).cuda()
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
@@ -314,7 +327,7 @@ def main_worker(gpu, ngpus_per_node, args):
         # evaluate on validation set
         metrics_dict = validate(val_loader, model, criterion, args)
         acc1s[epoch] = metrics_dict['top1'].avg
-        aucs[epoch] = metrics_dict['auc'].avg
+        # aucs[epoch] = metrics_dict['auc'].avg
         predictions = metrics_dict['predictions']
         labels = metrics_dict['labels']
 
@@ -327,28 +340,31 @@ def main_worker(gpu, ngpus_per_node, args):
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                 and args.gpu is None):
-            save_checkpoint({
+            ckpt = {
                 'epoch': epoch + 1,
                 'arch': args.arch,
                 'state_dict': model.state_dict(),
                 'best_acc1': best_acc1,
-                'auc': aucs[epoch].item(),
+                # 'auc': aucs[epoch].item(),
                 'optimizer' : optimizer.state_dict(),
                 'scheduler' : scheduler.state_dict(),
                 'labels': labels,
                 'predictions': predictions
-            }, is_best)
+            }
+            if args.search:
+                ckpt['mutator'] = mutator.state_dict()
+                ckpt['optimizer_mutator'] = optimizer_mutator.state_dict()
+            save_checkpoint(ckpt, is_best, args.log_dir, model)
+        if args.search:
+            arch_save_path = f'{args.log_dir}/archs'
+            os.system(f"mkdir -p {arch_save_path}")
+            mutator.save_arch(f'{arch_save_path}/arch_{epoch}_acc{acc1}.json')
 
-    return (losses, acc1s, aucs)
+    return (losses, acc1s)
+    # return (losses, acc1s, aucs)
 
 
-def _logits_and_loss(X, y, model, criterion, mutator=None):
-    if mutator is not None:
-        mutator.reset()
-    output = model(X)
-    loss = criterion(output, y)
-    return output, loss
-
+######## darts search related
 def _compute_virtual_model(X, y, model, optimizer, criterion, mutator, lr, momentum, weight_decay):
     """
     Compute unrolled weights w`
@@ -453,6 +469,8 @@ def search(
 
     end = time.time()
     for i, (trn_X, trn_y) in enumerate(train_loader):
+        if args.ipdb_debug and i == 10:
+            break
 
         # measure data loading time
         data_time.update(time.time() - end)
@@ -498,6 +516,12 @@ def search(
 
     return (float(losses.val))
 
+def _logits_and_loss(X, y, model, criterion, mutator=None):
+    if mutator is not None:
+        mutator.reset()
+    output = model(X)
+    loss = criterion(output, y)
+    return output, loss
 
 def train(train_loader, model, criterion, optimizer, epoch, device, args):
     batch_time = AverageMeter('Time', ':6.3f')
@@ -515,6 +539,8 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
 
     end = time.time()
     for i, (images, target) in enumerate(train_loader):
+        if args.ipdb_debug and i == 10:
+            break
 
         # measure data loading time
         data_time.update(time.time() - end)
@@ -546,7 +572,6 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
 
     return (float(losses.val))
 
-
 def validate(val_loader, model, criterion, args):
 
     def run_validate(loader, base_progress=0):
@@ -555,6 +580,8 @@ def validate(val_loader, model, criterion, args):
         with torch.no_grad():
             end = time.time()
             for i, (images, target) in enumerate(loader):
+                if args.ipdb_debug and i == 10:
+                    break
                 i = base_progress + i
 
                 if torch.cuda.is_available():
@@ -563,15 +590,15 @@ def validate(val_loader, model, criterion, args):
 
                 # compute output
                 output = model(images)
-                labels.append(target.cpu())
-                predictions.append(output.cpu())
+                labels.append(target)
+                predictions.append(output)
                 loss = criterion(output, target)
 
                 # measure accuracy and record loss
                 acc1, acc5 = accuracy(output, target, topk=(1, 5))
-                auc = roc_auc(output, target, num_classes=images.shape(-1))
+                # auc = roc_auc(output, target, num_classes=images.shape(-1))
                 losses.update(loss.item(), images.size(0))
-                aucs.update(np.mean(auc), images.size(0))
+                # aucs.update(np.mean(auc), images.size(0))
                 top1.update(acc1[0], images.size(0))
                 top5.update(acc5[0], images.size(0))
 
@@ -587,13 +614,17 @@ def validate(val_loader, model, criterion, args):
 
     batch_time = AverageMeter('Time', ':6.3f', Summary.NONE)
     losses = AverageMeter('Loss', ':.4e', Summary.NONE)
-    aucs = AverageMeter('AUC', ':.4e', Summary.NONE)
+    # aucs = AverageMeter('AUC', ':.4e', Summary.NONE)
     top1 = AverageMeter('Acc@1', ':6.2f', Summary.AVERAGE)
     top5 = AverageMeter('Acc@5', ':6.2f', Summary.AVERAGE)
     progress = ProgressMeter(
         len(val_loader) + (args.distributed and (len(val_loader.sampler) * args.world_size < len(val_loader.dataset))),
-        [batch_time, losses, aucs, top1, top5],
+        [batch_time, losses, top1, top5],
         prefix='Test: ')
+    # progress = ProgressMeter(
+    #     len(val_loader) + (args.distributed and (len(val_loader.sampler) * args.world_size < len(val_loader.dataset))),
+    #     [batch_time, losses, aucs, top1, top5],
+    #     prefix='Test: ')
 
     # switch to evaluate mode
     model.eval()
@@ -602,7 +633,7 @@ def validate(val_loader, model, criterion, args):
     if args.distributed:
         top1.all_reduce()
         top5.all_reduce()
-        aucs.all_reduce()    
+        # aucs.all_reduce()    
 
         labels_list = [torch.empty_like(labels) for _ in range(torch.distributed.get_world_size())]
         torch.distributed.all_gather(labels_list, labels)
@@ -625,17 +656,24 @@ def validate(val_loader, model, criterion, args):
     return {
         'top1': top1,
         'top5': top5,
-        'auc': aucs,
-        'losses': losses,
+        # 'auc': aucs,
+        'loss': losses,
         'labels': labels,
         'predictions': predictions
     }
 
-
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
-    torch.save(state, filename)
-    if is_best:
-        shutil.copyfile(filename, 'model_best.pth.tar')
+def save_checkpoint(state, is_best, filepath, ds_engine=None):
+    if ds_engine is not None:
+        # 使用DeepSpeedEngine 保存checkpoint数据
+        filename = f"{filepath}/checkpoints"
+        tag = 'best' if is_best else 'last'
+        ds_engine.save_checkpoint(filename, tag=tag, client_state=state)
+    else:
+        # 使用原始pytorch保存checkpoint数据
+        filename = f"{filepath}/checkpoint.pth.tar"
+        torch.save(state, filename)
+        if is_best:
+            shutil.copyfile(filename, 'model_best.pth.tar')
 
 
 class Summary(Enum):

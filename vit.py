@@ -83,7 +83,8 @@ class Attention(nn.Module):
     ):
         super().__init__()
         self.mask = mask
-        self.heads_list = keepPositiveList([int(r*heads) for r in search_ratio])
+        self.search_ratio = search_ratio
+        self.heads_list = [x for x in range(1, heads+1) if dim%x==0]
         self.dim_head_list = keepPositiveList([int(r*dim_head) for r in search_ratio])
         self.scale_list = [dh**-0.5 for dh in self.dim_head_list]
 
@@ -281,7 +282,7 @@ class VisionTransformer(BaseNASNetwork):
         mask: dict = None, # mask for the search space (mutables)
     ):
         super().__init__(mask = mask)
-        self.to_search_path = to_search_depth
+        self.to_searcg_depth = to_search_depth
         
         self.vit_embed = VitEmbedding(image_size, patch_size, channels, dim, emb_dropout)
 
@@ -294,13 +295,13 @@ class VisionTransformer(BaseNASNetwork):
 
         self.vit_cls_head = VitClsHead(pool, dim, num_classes)
 
-        if self.to_search_path:
+        if self.to_searcg_depth:
             runtime_depth = [v for v in range(1, depth + 1)]    
             self.run_depth = spaces.ValueSpace(runtime_depth, key='run_depth', mask=self.mask)
 
     def forward(self, x):
         out = self.vit_embed(x)
-        if self.to_search_path:
+        if self.to_searcg_depth:
             vit_blocks = list(self.vit_blocks.children())
             runtime_depth = self.run_depth.value
             vit_blocks = vit_blocks[:runtime_depth]
