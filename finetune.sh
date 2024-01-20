@@ -8,7 +8,7 @@ mkdir -p "$logs_dir"
 current_time=$(date +"%Y_%m_%d_%H_%M_%S")
 
 seed=666
-lr=0.01
+lr=0.001
 
 resume=$1
 

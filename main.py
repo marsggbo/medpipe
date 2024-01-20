@@ -30,6 +30,7 @@ from torch.utils.data import Subset, ConcatDataset
 from sklearn.metrics import roc_auc_score
 
 from hyperbox.mutator import OnehotMutator, RandomMutator
+from hyperbox.utils.utils import load_json
 
 from ham10000_datamodule import Ham10000Dataset
 from vit import VisionTransformer, ViT_B, ViT_L
@@ -198,10 +199,11 @@ def main_worker(gpu, ngpus_per_node, args):
             mutator.parameters(), lr=0.001, betas=(0.5, 0.999), weight_decay=1.0E-3)
 
     if args.arch_path:
+        if mutator is None:
+            mutator = OnehotMutator(model)
         os.system(f"cp {args.arch_path} {args.log_dir}/") # backup the arch json file
-        mutator = OnehotMutator(model)
-        with open(args.arch_path, 'r') as f:
-            mask = json.load(f)
+        print(f"backup the arch json file to {args.log_dir}/{args.arch_path.split('/')[-1]}")
+        mask = load_json(args.arch_path)
         mutator.sample_by_mask(mask)
 
     # In case of distributed process, initializes the distributed backend
