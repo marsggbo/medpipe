@@ -10,17 +10,17 @@ current_time=$(date +"%Y_%m_%d_%H_%M_%S")
 seed=666
 lr=0.01
 
-############# search
+resume=$1
+
 # 创建一个以时间为名的子文件夹
-subfolder="$logs_dir/search/$current_time"
+subfolder="$logs_dir/finetune/$current_time"
 mkdir -p "$subfolder"
 echo "Generated subfolder for logging: $subfolder"
 
-CUDA_VISIBLE_DEVICES=0 deepspeed main.py -a vit_b \
+CUDA_VISIBLE_DEVICES=1 deepspeed --master_port 60000 main.py \
 --deepspeed \
 --deepspeed_config ds_fp16_config.json \
 --multiprocessing_distributed \
---search \
 --seed ${seed} \
 --concat_train_val \
 --lr ${lr} \
@@ -29,3 +29,10 @@ CUDA_VISIBLE_DEVICES=0 deepspeed main.py -a vit_b \
 --print-freq 100 \
 --log_dir ${subfolder} \
 $@ 2>&1 | tee "$subfolder/output.log" 
+
+
+# ###### train resnet50
+# bash finetune.sh -a resnet50 
+
+# ###### resume searching/training model
+# bash finetune.sh -a vit_b --resume /path/to/name.pt

@@ -6,6 +6,7 @@ import shutil
 import time
 import warnings
 import copy
+import json
 from enum import Enum
 
 import itertools
@@ -122,6 +123,7 @@ best_auc = 0
 
 def main():
     args = add_argument()
+    print(f"rank{args.local_rank} args:{args}")
     if args.ipdb_debug:
         from ipdb import set_trace
         set_trace()
@@ -181,16 +183,26 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.arch in model_names:
         if args.pretrained:
             print(f"rank{args.local_rank}=> using pre-trained model '{args.arch}'")
-            model = models.__dict__[args.arch](pretrained=True)
+            model = models.__dict__[args.arch](pretrained=True, num_classes=args.num_classes)
         else:
             print(f"rank{args.local_rank}=> creating model '{args.arch}'")
-            model = models.__dict__[args.arch]()
+            model = models.__dict__[args.arch](num_classes=args.num_classes)
     elif args.arch.lower() in custom_model_names:
         model = custom_model_names[args.arch](image_size=(448,608), num_classes=args.num_classes)
 
-    mutator = OnehotMutator(model)
-    optimizer_mutator = torch.optim.Adam(
-        mutator.parameters(), lr=0.001, betas=(0.5, 0.999), weight_decay=1.0E-3)
+    mutator = None
+    optimizer_mutator = None
+    if args.search:
+        mutator = OnehotMutator(model)
+        optimizer_mutator = torch.optim.Adam(
+            mutator.parameters(), lr=0.001, betas=(0.5, 0.999), weight_decay=1.0E-3)
+
+    if args.arch_path:
+        os.system(f"cp {args.arch_path} {args.log_dir}/") # backup the arch json file
+        mutator = OnehotMutator(model)
+        with open(args.arch_path, 'r') as f:
+            mask = json.load(f)
+        mutator.sample_by_mask(mask)
 
     # In case of distributed process, initializes the distributed backend
     # which will take care of sychronizing nodes/GPUs
@@ -300,7 +312,8 @@ def main_worker(gpu, ngpus_per_node, args):
 
 
     if args.evaluate:
-        mutator.reset()
+        if mutator is not None:
+            mutator.reset()
         loss = torch.empty(1).cuda()
         acc1 = torch.empty(1).cuda()
         metrics_dict = validate(test_loader, model, criterion, args)
@@ -308,7 +321,7 @@ def main_worker(gpu, ngpus_per_node, args):
         acc1[0] = metrics_dict['top1'].avg
         # auc = metrics_dict['auc'].avg
         # print(f'Accuracy: {acc1:.4f} AUC:{auc:.4f}')
-        print(f'Accuracy: {acc1:.4f} ')
+        print(f'Accuracy: {acc1} ')
         return (loss, acc1)
 
     losses = torch.empty(args.epochs).cuda()
